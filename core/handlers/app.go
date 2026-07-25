@@ -9742,6 +9742,9 @@ func (a *App) pluginRuntime() *plugin.Runtime {
 		AttachmentMeta:           a.attachmentMetaPlugin,
 		ActiveTheme:              a.activeThemeName,
 		ContentRenderMode:        a.contentRenderModePlugin,
+		SendMail:                 a.sendMailPlugin,
+		AvailableLanguages:       a.availableLanguagesPlugin,
+		NegotiateLanguage:        a.negotiateLanguagePlugin,
 	}
 	runtime.DispatchHook = func(ctx context.Context, name string, payload any) (plugin.HookDispatch, error) {
 		return a.Plugins.DispatchActive(plugin.ContextWithRuntime(ctx, runtime), name, payload)
@@ -11598,12 +11601,14 @@ func (a *App) negotiateLanguagePlugin(ctx context.Context, r *http.Request) stri
 	return selected
 }
 
-// shortcodePattern matches [name attr="value" attr=value]body[/name] or the
-// self-closing [name attr="value" /] form. Attribute values may be quoted
-// (single or double) or bareword; the parser is intentionally strict about
-// what it accepts so untrusted content cannot craft an unbounded match that
-// blows up the renderer.
-var shortcodePattern = regexp.MustCompile(`(?s)\[([a-z][a-z0-9_-]{0,31})((?:\s+[a-z][a-z0-9_-]*(?:=(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s\]"'<>]+))?)*)\s*(?:/\]|\](.*?)\[/\s*\1\s*\])`)
+// shortcodeOpenPattern matches an opening [name attr="value" attr=value]
+// or the self-closing [name ... /] form. Go's RE2 engine has no
+// backreferences, so we can't express "matching closing tag" in one
+// pattern — the expander below scans for the corresponding [/name]
+// manually. Attribute values may be quoted (single or double) or bareword;
+// the parser is intentionally strict about what it accepts so untrusted
+// content cannot craft an unbounded match that blows up the renderer.
+var shortcodeOpenPattern = regexp.MustCompile(`\[([a-z][a-z0-9_-]{0,31})((?:\s+[a-z][a-z0-9_-]*(?:=(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s\]"'<>]+))?)*)\s*(/?)\]`)
 
 var shortcodeAttrPattern = regexp.MustCompile(`([a-z][a-z0-9_-]*)(?:=("[^"\r\n]*"|'[^'\r\n]*'|[^\s\]"'<>]+))?`)
 
@@ -11617,31 +11622,52 @@ func (a *App) expandShortcodes(ctx context.Context, htmlBody string, content mod
 	if !strings.Contains(htmlBody, "[") {
 		return template.HTML(htmlBody), nil
 	}
+	openings := shortcodeOpenPattern.FindAllStringSubmatchIndex(htmlBody, -1)
+	if len(openings) == 0 {
+		return template.HTML(htmlBody), nil
+	}
 	var (
 		builder strings.Builder
 		lastEnd int
 		hookErr error
 	)
-	matches := shortcodePattern.FindAllStringSubmatchIndex(htmlBody, -1)
-	if len(matches) == 0 {
-		return template.HTML(htmlBody), nil
-	}
 	// Cap the number of substitutions per render to protect against
 	// pathological content that would otherwise spawn thousands of hook
 	// dispatches on a single page load.
 	const maxShortcodes = 128
-	for i, indices := range matches {
-		if i >= maxShortcodes {
+	processed := 0
+	for _, indices := range openings {
+		openStart, openEnd := indices[0], indices[1]
+		if openStart < lastEnd {
+			// Skip openings that fall inside the body of a previously
+			// matched paired shortcode.
+			continue
+		}
+		if processed >= maxShortcodes {
 			break
 		}
-		start, end := indices[0], indices[1]
-		builder.WriteString(htmlBody[lastEnd:start])
 		name := htmlBody[indices[2]:indices[3]]
 		attrs := parseShortcodeAttrs(htmlBody[indices[4]:indices[5]])
+		selfClose := indices[6] >= 0 && indices[7] > indices[6] && htmlBody[indices[6]:indices[7]] == "/"
+
+		blockEnd := openEnd
 		body := ""
-		if indices[6] >= 0 {
-			body = htmlBody[indices[6]:indices[7]]
+		if !selfClose {
+			// Look for the matching [/name] tag. Only strict lowercase
+			// letters/digits/underscore-dash names are recognised so the
+			// scan is bounded and predictable.
+			closeTag := "[/" + name + "]"
+			idx := strings.Index(htmlBody[openEnd:], closeTag)
+			if idx < 0 {
+				// No closing tag → treat as self-closing so authors get
+				// visible feedback instead of losing content silently.
+				selfClose = true
+			} else {
+				body = htmlBody[openEnd : openEnd+idx]
+				blockEnd = openEnd + idx + len(closeTag)
+			}
 		}
+		builder.WriteString(htmlBody[lastEnd:openStart])
 		payload := plugin.ShortcodePayload{
 			Content: publicContentFromModel(content),
 			Name:    name,
@@ -11657,12 +11683,15 @@ func (a *App) expandShortcodes(ctx context.Context, htmlBody string, content mod
 		if !ok || !next.Handled {
 			// Leave the shortcode intact so authors can see it was not
 			// consumed. This is the safer default than dropping content.
-			builder.WriteString(htmlBody[start:end])
-			lastEnd = end
+			builder.WriteString(htmlBody[openStart:blockEnd])
+			lastEnd = blockEnd
+			processed++
+			_ = selfClose
 			continue
 		}
 		builder.WriteString(string(render.SanitizeHTML(string(next.Output), trust)))
-		lastEnd = end
+		lastEnd = blockEnd
+		processed++
 	}
 	if hookErr != nil {
 		return "", hookErr

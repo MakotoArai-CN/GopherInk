@@ -277,6 +277,20 @@ type Runtime struct {
 	AttachmentMeta           func(context.Context, int64) (AttachmentMetaInfo, error)
 	ActiveTheme              func(context.Context) string
 	ContentRenderMode        func(context.Context) string
+	// SendMail dispatches a MailMessage through the mail.before_send /
+	// mail.after_send hook pipeline. The core validates the envelope (CRLF
+	// rejection, non-empty recipient set, non-empty subject/body) and then
+	// hands off to whichever plugin claims responsibility for delivery.
+	SendMail func(context.Context, MailMessage) error
+	// AvailableLanguages returns the language tags the host i18n table
+	// currently recognises. Route negotiators use this to clamp their
+	// choices to a supported subset.
+	AvailableLanguages func(context.Context) []string
+	// NegotiateLanguage runs the route.language_negotiate pipeline for a
+	// request and returns the resolved language. It never returns an empty
+	// string — falling back to the site default when no plugin claims the
+	// request.
+	NegotiateLanguage func(context.Context, *http.Request) string
 }
 
 type runtimeContextKey struct{}
